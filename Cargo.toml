@@ -1,0 +1,11 @@
+[package]
+name = "nova3d"
+version = "0.1.0"
+edition = "2021"
+description = "A CPU-first 3D engine built incrementally: math core, scene graph, software rasterizer"
+license = "MIT"
+
+[dependencies]
+
+[profile.release]
+opt-level = 3
