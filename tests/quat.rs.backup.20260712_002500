@@ -1,0 +1,75 @@
+#[path = "../src/math/vec3.rs"]
+pub mod vec3;
+
+mod math {
+    pub use crate::vec3;
+}
+
+#[path = "../src/math/quat.rs"]
+mod quat;
+
+use quat::Quat;
+use vec3::Vec3;
+
+fn assert_vec3_near(actual: Vec3, expected: Vec3) {
+    assert!((actual.x - expected.x).abs() < 1.0e-6);
+    assert!((actual.y - expected.y).abs() < 1.0e-6);
+    assert!((actual.z - expected.z).abs() < 1.0e-6);
+}
+
+#[test]
+fn builds_identity_and_axis_angle_quaternions() {
+    assert_eq!(
+        Quat::identity(),
+        Quat {
+            x: 0.0,
+            y: 0.0,
+            z: 0.0,
+            w: 1.0,
+        }
+    );
+
+    let quarter_turn = Quat::from_axis_angle(
+        Vec3::new(0.0, 0.0, 1.0),
+        std::f32::consts::FRAC_PI_2,
+    );
+    assert_vec3_near(
+        quarter_turn.rotate_vec3(Vec3::new(1.0, 0.0, 0.0)),
+        Vec3::new(0.0, 1.0, 0.0),
+    );
+}
+
+#[test]
+fn normalizes_and_multiplies_quaternions() {
+    let normalized = Quat {
+        x: 0.0,
+        y: 0.0,
+        z: 0.0,
+        w: 2.0,
+    }
+    .normalize();
+    assert_eq!(normalized, Quat::identity());
+
+    let turn_x = Quat::from_axis_angle(Vec3::new(1.0, 0.0, 0.0), std::f32::consts::FRAC_PI_2);
+    let turn_z = Quat::from_axis_angle(Vec3::new(0.0, 0.0, 1.0), std::f32::consts::FRAC_PI_2);
+    let combined = turn_z.multiply(turn_x);
+
+    assert_vec3_near(
+        combined.rotate_vec3(Vec3::new(0.0, 1.0, 0.0)),
+        Vec3::new(-1.0, 0.0, 0.0),
+    );
+}
+
+#[test]
+fn zero_quaternion_normalizes_to_identity() {
+    assert_eq!(
+        Quat {
+            x: 0.0,
+            y: 0.0,
+            z: 0.0,
+            w: 0.0,
+        }
+        .normalize(),
+        Quat::identity()
+    );
+}

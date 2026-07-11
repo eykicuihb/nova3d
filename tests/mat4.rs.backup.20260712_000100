@@ -1,0 +1,96 @@
+mod math {
+    #[path = "../../src/math/vec3.rs"]
+    pub mod vec3;
+    #[path = "../../src/math/mat4.rs"]
+    pub mod mat4;
+}
+
+use math::mat4::Mat4;
+use math::vec3::Vec3;
+
+fn assert_matrix_near(actual: Mat4, expected: Mat4) {
+    for (actual, expected) in actual.data.iter().zip(expected.data.iter()) {
+        assert!((actual - expected).abs() < 1.0e-6, "{actual} != {expected}");
+    }
+}
+
+#[test]
+fn builds_identity_translation_and_scale_matrices() {
+    assert_eq!(
+        Mat4::identity().data,
+        [
+            1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0,
+            0.0, 1.0
+        ]
+    );
+    assert_eq!(
+        Mat4::from_translation(Vec3::new(2.0, 3.0, 4.0)).data,
+        [
+            1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 2.0, 3.0, 4.0,
+            1.0
+        ]
+    );
+    assert_eq!(
+        Mat4::from_scale(Vec3::new(2.0, 3.0, 4.0)).data,
+        [
+            2.0, 0.0, 0.0, 0.0, 0.0, 3.0, 0.0, 0.0, 0.0, 0.0, 4.0, 0.0, 0.0, 0.0,
+            0.0, 1.0
+        ]
+    );
+}
+
+#[test]
+fn multiplies_and_transposes_column_major_matrices() {
+    let translation = Mat4::from_translation(Vec3::new(2.0, 3.0, 4.0));
+    let scale = Mat4::from_scale(Vec3::new(2.0, 3.0, 4.0));
+
+    assert_eq!(translation.multiply(Mat4::identity()), translation);
+    assert_eq!(
+        translation.multiply(scale).data,
+        [
+            2.0, 0.0, 0.0, 0.0, 0.0, 3.0, 0.0, 0.0, 0.0, 0.0, 4.0, 0.0, 2.0, 3.0, 4.0,
+            1.0
+        ]
+    );
+    assert_eq!(
+        translation.transpose().data,
+        [
+            1.0, 0.0, 0.0, 2.0, 0.0, 1.0, 0.0, 3.0, 0.0, 0.0, 1.0, 4.0, 0.0, 0.0, 0.0,
+            1.0
+        ]
+    );
+}
+
+#[test]
+fn builds_a_right_handed_opengl_perspective_projection() {
+    let projection = Mat4::perspective(
+        std::f32::consts::FRAC_PI_2,
+        2.0,
+        1.0,
+        11.0,
+    );
+
+    assert_matrix_near(
+        projection,
+        Mat4 {
+            data: [
+                0.5,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                1.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                -1.2,
+                -1.0,
+                0.0,
+                0.0,
+                -2.2,
+                0.0,
+            ],
+        },
+    );
+}
