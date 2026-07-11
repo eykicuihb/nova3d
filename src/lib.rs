@@ -10,3 +10,5 @@
 //! - No GPU or windowing dependencies; everything must be testable headless in CI.
 //! - Determinism first: identical inputs produce byte-identical framebuffers.
 //! - Each module is added behind its own wave; keep `lib.rs` exports explicit.
+
+pub mod math {}
