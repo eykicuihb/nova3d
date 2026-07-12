@@ -14,11 +14,17 @@
 /// Core vector, matrix, and quaternion math types.
 pub mod math;
 
+/// Perspective camera (look-at view + projection).
+pub mod camera;
+
 /// Transform hierarchy and scene graph types.
 pub mod scene;
 
 /// Software rasterizer producing deterministic framebuffers.
 pub mod raster;
+
+/// Mesh → screen pipeline (model, view-projection, rasterize).
+pub mod render;
 
 /// Framebuffer export (PPM) for golden-image tests.
 pub mod io;
