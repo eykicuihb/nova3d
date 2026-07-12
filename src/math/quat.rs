@@ -1,3 +1,6 @@
+#[cfg(not(test))]
+use super::Vec3;
+#[cfg(test)]
 use crate::math::vec3::Vec3;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
