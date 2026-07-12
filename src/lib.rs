@@ -19,3 +19,6 @@ pub mod scene;
 
 /// Software rasterizer producing deterministic framebuffers.
 pub mod raster;
+
+/// Framebuffer export (PPM) for golden-image tests.
+pub mod io;
