@@ -1,7 +1,4 @@
-#[path = "../src/math/vec3.rs"]
-mod vec3;
-
-use vec3::Vec3;
+use nova3d::math::Vec3;
 
 #[test]
 fn supports_construction_and_arithmetic() {
