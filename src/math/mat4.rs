@@ -1,4 +1,4 @@
-use crate::math::vec3::Vec3;
+use super::Vec3;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Mat4 {

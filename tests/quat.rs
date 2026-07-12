@@ -1,15 +1,4 @@
-#[path = "../src/math/vec3.rs"]
-pub mod vec3;
-
-mod math {
-    pub use crate::vec3;
-}
-
-#[path = "../src/math/quat.rs"]
-mod quat;
-
-use quat::Quat;
-use vec3::Vec3;
+use nova3d::math::{Quat, Vec3};
 
 fn assert_vec3_near(actual: Vec3, expected: Vec3) {
     assert!((actual.x - expected.x).abs() < 1.0e-6);

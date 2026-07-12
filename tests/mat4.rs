@@ -1,15 +1,4 @@
-#[path = "../src/math/vec3.rs"]
-pub mod vec3;
-
-mod math {
-    pub use crate::vec3;
-}
-
-#[path = "../src/math/mat4.rs"]
-mod mat4;
-
-use mat4::Mat4;
-use vec3::Vec3;
+use nova3d::math::{Mat4, Vec3};
 
 fn assert_matrix_near(actual: Mat4, expected: Mat4) {
     for (actual, expected) in actual.data.iter().zip(expected.data.iter()) {
