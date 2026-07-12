@@ -26,5 +26,8 @@ pub mod raster;
 /// Mesh → screen pipeline (model, view-projection, rasterize).
 pub mod render;
 
+/// Built-in mesh primitives (unit cube, etc.).
+pub mod mesh;
+
 /// Framebuffer export (PPM) for golden-image tests.
 pub mod io;
