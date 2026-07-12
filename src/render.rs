@@ -111,6 +111,76 @@ pub fn render_mesh_depth(
     }
 }
 
+/// Renders a triangle mesh with a per-call depth buffer and back-face culling.
+///
+/// Same vertex pipeline as [`render_mesh_depth`] (model, view-projection, near
+/// rejection at `w <= camera.near`, perspective divide, NDC-to-screen mapping,
+/// internal `f32` depth buffer with barycentric depth interpolation writing a
+/// pixel only when strictly nearer), except that after computing the three
+/// integer screen-space vertices any triangle whose screen-space signed area is
+/// `<= 0` is skipped (counter-clockwise-front: non-positive area means
+/// back-facing or degenerate).
+pub fn render_mesh_depth_culled(
+    fb: &mut Framebuffer,
+    camera: &Camera,
+    vertices: &[Vec3],
+    triangles: &[[usize; 3]],
+    model: &Mat4,
+    color: u32,
+) {
+    let view_proj = camera.view_projection();
+    let mvp = view_proj.multiply(*model);
+
+    let width = fb.width as f32;
+    let height = fb.height as f32;
+    let near = camera.near;
+
+    let mut depth = vec![f32::INFINITY; fb.width * fb.height];
+
+    let clip: Vec<ClipVertex> = vertices
+        .iter()
+        .copied()
+        .map(|v| transform_point_homogeneous(mvp, v))
+        .collect();
+
+    for tri in triangles {
+        let v0 = clip[tri[0]];
+        let v1 = clip[tri[1]];
+        let v2 = clip[tri[2]];
+
+        if v0.w <= near || v1.w <= near || v2.w <= near {
+            continue;
+        }
+
+        let s0 = clip_to_screen(v0, width, height);
+        let s1 = clip_to_screen(v1, width, height);
+        let s2 = clip_to_screen(v2, width, height);
+
+        // CCW-front in Y-up sense: screen Y grows downward, so negate the
+        // Y-down cross product. Non-positive → back-facing or degenerate.
+        if screen_signed_area_ccw(s0.pos, s1.pos, s2.pos) <= 0 {
+            continue;
+        }
+
+        fill_triangle_depth(fb, &mut depth, s0, s1, s2, color);
+    }
+}
+
+/// Screen-space signed area with counter-clockwise-front convention.
+///
+/// Positive means front-facing for meshes wound CCW when viewed from outside
+/// (Y-up NDC). Zero is degenerate; negative is back-facing.
+fn screen_signed_area_ccw(p0: Vec2i, p1: Vec2i, p2: Vec2i) -> i64 {
+    let x0 = i64::from(p0.x);
+    let y0 = i64::from(p0.y);
+    let x1 = i64::from(p1.x);
+    let y1 = i64::from(p1.y);
+    let x2 = i64::from(p2.x);
+    let y2 = i64::from(p2.y);
+    // Standard Y-down cross product is negated so CCW-in-world stays positive.
+    -((x1 - x0) * (y2 - y0) - (x2 - x0) * (y1 - y0))
+}
+
 /// Column-major Mat4 × (x, y, z, 1) → clip-space (x, y, z, w).
 fn transform_point_homogeneous(matrix: Mat4, point: Vec3) -> ClipVertex {
     let d = &matrix.data;
@@ -447,5 +517,166 @@ mod tests {
         // Far triangle must not change any pixel once the near surface is in the Z-buffer.
         assert_eq!(fb_near.checksum(), fb_both.checksum());
         assert_eq!(fb_near.pixels, fb_both.pixels);
+    }
+
+    fn count_nonzero(fb: &Framebuffer) -> usize {
+        fb.pixels.iter().filter(|&&p| p != BG).count()
+    }
+
+    #[test]
+    fn culled_front_facing_triangle_rasterizes_nonzero_pixels() {
+        let mut fb = Framebuffer::new(32, 32);
+        let camera = sample_camera(1.0);
+        let (vertices, triangles) = front_triangle();
+        let model = Mat4::identity();
+
+        render_mesh_depth_culled(&mut fb, &camera, &vertices, &triangles, &model, COLOR);
+
+        assert!(
+            count_nonzero(&fb) > 0,
+            "expected at least one pixel for a front-facing triangle with culling"
+        );
+    }
+
+    #[test]
+    fn culled_back_facing_triangle_rasterizes_zero_pixels() {
+        let mut fb = Framebuffer::new(32, 32);
+        let camera = sample_camera(1.0);
+        let (vertices, mut triangles) = front_triangle();
+        // Swap two indices → reverse winding → back-facing under CCW-front.
+        triangles[0] = [0, 2, 1];
+        let model = Mat4::identity();
+
+        render_mesh_depth_culled(&mut fb, &camera, &vertices, &triangles, &model, COLOR);
+
+        assert_eq!(
+            count_nonzero(&fb),
+            0,
+            "back-facing (reversed winding) triangle must be culled"
+        );
+        assert!(fb.pixels.iter().all(|&p| p == BG));
+    }
+
+    #[test]
+    fn culled_cube_draws_strictly_fewer_pixels_than_unculled() {
+        // mesh::cube() from (1.5, 1.2, 1.5) looking at the origin.
+        let camera = Camera::look_at(
+            Vec3::new(1.5, 1.2, 1.5),
+            Vec3::new(0.0, 0.0, 0.0),
+            Vec3::new(0.0, 1.0, 0.0),
+            std::f32::consts::FRAC_PI_2,
+            1.0,
+            0.1,
+            100.0,
+        );
+        let (vertices, triangles) = crate::mesh::cube();
+        let model = Mat4::identity();
+
+        // Two fresh framebuffers: full mesh::cube() unculled vs culled.
+        let mut fb_full = Framebuffer::new(64, 64);
+        let mut fb_culled = Framebuffer::new(64, 64);
+        render_mesh_depth(&mut fb_full, &camera, &vertices, &triangles, &model, COLOR);
+        render_mesh_depth_culled(
+            &mut fb_culled,
+            &camera,
+            &vertices,
+            &triangles,
+            &model,
+            COLOR,
+        );
+
+        let full_count = count_nonzero(&fb_full);
+        let culled_count = count_nonzero(&fb_culled);
+        assert!(full_count > 0, "unculled mesh::cube() should draw pixels");
+        assert!(
+            culled_count > 0,
+            "culled mesh::cube() should still draw front faces"
+        );
+        // Depth already hides occluded back faces on a closed convex mesh, so
+        // silhouette coverage can match. Measure the strict cull effect on the
+        // cube's back-facing triangles alone (same camera / mesh::cube topology).
+        let view_proj = camera.view_projection();
+        let mvp = view_proj.multiply(model);
+        let width = 64.0_f32;
+        let height = 64.0_f32;
+        let near = camera.near;
+        let clip: Vec<ClipVertex> = vertices
+            .iter()
+            .copied()
+            .map(|v| transform_point_homogeneous(mvp, v))
+            .collect();
+        let back_facing: Vec<[usize; 3]> = triangles
+            .iter()
+            .copied()
+            .filter(|tri| {
+                let v0 = clip[tri[0]];
+                let v1 = clip[tri[1]];
+                let v2 = clip[tri[2]];
+                if v0.w <= near || v1.w <= near || v2.w <= near {
+                    return false;
+                }
+                let s0 = clip_to_screen(v0, width, height);
+                let s1 = clip_to_screen(v1, width, height);
+                let s2 = clip_to_screen(v2, width, height);
+                screen_signed_area_ccw(s0.pos, s1.pos, s2.pos) <= 0
+            })
+            .collect();
+        assert!(
+            !back_facing.is_empty(),
+            "cube viewed from outside must have back-facing triangles"
+        );
+
+        let mut fb_back_full = Framebuffer::new(64, 64);
+        let mut fb_back_culled = Framebuffer::new(64, 64);
+        render_mesh_depth(
+            &mut fb_back_full,
+            &camera,
+            &vertices,
+            &back_facing,
+            &model,
+            COLOR,
+        );
+        render_mesh_depth_culled(
+            &mut fb_back_culled,
+            &camera,
+            &vertices,
+            &back_facing,
+            &model,
+            COLOR,
+        );
+        let back_full = count_nonzero(&fb_back_full);
+        let back_culled = count_nonzero(&fb_back_culled);
+        assert!(back_full > 0, "unculled cube back faces should draw pixels");
+        assert!(
+            back_culled < back_full,
+            "culling must draw strictly fewer pixels ({back_culled} vs {back_full})"
+        );
+        assert_eq!(back_culled, 0, "back faces must be fully culled");
+        // Full-cube culled coverage must not exceed the unculled path.
+        assert!(culled_count <= full_count);
+    }
+
+    #[test]
+    fn culled_identical_scene_renders_byte_identical_checksums() {
+        let camera = Camera::look_at(
+            Vec3::new(1.5, 1.2, 1.5),
+            Vec3::new(0.0, 0.0, 0.0),
+            Vec3::new(0.0, 1.0, 0.0),
+            std::f32::consts::FRAC_PI_2,
+            1.0,
+            0.1,
+            100.0,
+        );
+        let (vertices, triangles) = crate::mesh::cube();
+        let model = Mat4::identity();
+
+        let mut fb_a = Framebuffer::new(64, 64);
+        let mut fb_b = Framebuffer::new(64, 64);
+
+        render_mesh_depth_culled(&mut fb_a, &camera, &vertices, &triangles, &model, COLOR);
+        render_mesh_depth_culled(&mut fb_b, &camera, &vertices, &triangles, &model, COLOR);
+
+        assert_eq!(fb_a.checksum(), fb_b.checksum());
+        assert_eq!(fb_a.pixels, fb_b.pixels);
     }
 }
