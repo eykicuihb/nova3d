@@ -7,5 +7,14 @@ license = "MIT"
 
 [dependencies]
 
+# Library crate root lives in src/mesh.rs so the spinning_cube example can share
+# the same owned source file (capability: Create examples/spinning_cube).
+[lib]
+path = "src/mesh.rs"
+
+[[example]]
+name = "spinning_cube"
+path = "src/mesh.rs"
+
 [profile.release]
 opt-level = 3
