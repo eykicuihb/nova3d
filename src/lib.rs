@@ -16,3 +16,6 @@ pub mod math;
 
 /// Transform hierarchy and scene graph types.
 pub mod scene;
+
+/// Software rasterizer producing deterministic framebuffers.
+pub mod raster;
