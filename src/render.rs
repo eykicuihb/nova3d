@@ -166,6 +166,103 @@ pub fn render_mesh_depth_culled(
     }
 }
 
+/// Minimum Lambert ambient so fully back-lit but visible faces are not pure black.
+const LAMBERT_MIN_BRIGHTNESS: f32 = 0.15;
+
+/// Renders a triangle mesh with depth, back-face culling, and parallel-light Lambert shading.
+///
+/// Same vertex pipeline as [`render_mesh_depth_culled`] (model, view-projection, near
+/// rejection at `w <= camera.near`, perspective divide, NDC-to-screen mapping, screen-space
+/// back-face culling, internal `f32` depth buffer with barycentric depth interpolation).
+///
+/// Per triangle, a world-space face normal is formed from the model-transformed vertices
+/// (before the camera transform) via the cross product of two edge vectors, then normalized.
+/// Brightness is `max(0.15, N · normalize(-light_dir))`. The R/G/B channels of `base_color`
+/// are scaled by that brightness; alpha is forced to `0xFF`.
+pub fn render_mesh_lit(
+    fb: &mut Framebuffer,
+    camera: &Camera,
+    vertices: &[Vec3],
+    triangles: &[[usize; 3]],
+    model: &Mat4,
+    base_color: u32,
+    light_dir: Vec3,
+) {
+    let view_proj = camera.view_projection();
+    let mvp = view_proj.multiply(*model);
+
+    let width = fb.width as f32;
+    let height = fb.height as f32;
+    let near = camera.near;
+
+    let mut depth = vec![f32::INFINITY; fb.width * fb.height];
+
+    // World-space positions: model transform only (before camera / view-projection).
+    let world: Vec<Vec3> = vertices
+        .iter()
+        .copied()
+        .map(|v| transform_point_affine(*model, v))
+        .collect();
+
+    let clip: Vec<ClipVertex> = vertices
+        .iter()
+        .copied()
+        .map(|v| transform_point_homogeneous(mvp, v))
+        .collect();
+
+    // Direction toward the light source (opposite of light travel direction).
+    let light_toward = light_dir.scale(-1.0).normalize();
+
+    for tri in triangles {
+        let v0 = clip[tri[0]];
+        let v1 = clip[tri[1]];
+        let v2 = clip[tri[2]];
+
+        if v0.w <= near || v1.w <= near || v2.w <= near {
+            continue;
+        }
+
+        let s0 = clip_to_screen(v0, width, height);
+        let s1 = clip_to_screen(v1, width, height);
+        let s2 = clip_to_screen(v2, width, height);
+
+        // CCW-front in Y-up sense: screen Y grows downward, so negate the
+        // Y-down cross product. Non-positive → back-facing or degenerate.
+        if screen_signed_area_ccw(s0.pos, s1.pos, s2.pos) <= 0 {
+            continue;
+        }
+
+        let w0 = world[tri[0]];
+        let w1 = world[tri[1]];
+        let w2 = world[tri[2]];
+        let edge1 = w1.sub(w0);
+        let edge2 = w2.sub(w0);
+        let normal = edge1.cross(edge2).normalize();
+
+        let brightness = normal.dot(light_toward).max(LAMBERT_MIN_BRIGHTNESS);
+        let color = shade_lambert(base_color, brightness);
+
+        fill_triangle_depth(fb, &mut depth, s0, s1, s2, color);
+    }
+}
+
+/// Affine model transform: Mat4 × (x, y, z, 1) → world-space xyz (w discarded).
+fn transform_point_affine(matrix: Mat4, point: Vec3) -> Vec3 {
+    let h = transform_point_homogeneous(matrix, point);
+    Vec3::new(h.x, h.y, h.z)
+}
+
+/// Scale `base_color` RGB by `brightness` (AARRGGBB); alpha forced to `0xFF`.
+fn shade_lambert(base_color: u32, brightness: f32) -> u32 {
+    let r = ((base_color >> 16) & 0xFF) as f32 * brightness;
+    let g = ((base_color >> 8) & 0xFF) as f32 * brightness;
+    let b = (base_color & 0xFF) as f32 * brightness;
+    let r = r.round().clamp(0.0, 255.0) as u32;
+    let g = g.round().clamp(0.0, 255.0) as u32;
+    let b = b.round().clamp(0.0, 255.0) as u32;
+    0xFF00_0000 | (r << 16) | (g << 8) | b
+}
+
 /// Screen-space signed area with counter-clockwise-front convention.
 ///
 /// Positive means front-facing for meshes wound CCW when viewed from outside
@@ -675,6 +772,114 @@ mod tests {
 
         render_mesh_depth_culled(&mut fb_a, &camera, &vertices, &triangles, &model, COLOR);
         render_mesh_depth_culled(&mut fb_b, &camera, &vertices, &triangles, &model, COLOR);
+
+        assert_eq!(fb_a.checksum(), fb_b.checksum());
+        assert_eq!(fb_a.pixels, fb_b.pixels);
+    }
+
+    /// Mean luminance of non-background pixels (AARRGGBB → 0.299R+0.587G+0.114B).
+    fn mean_luminance(fb: &Framebuffer) -> f32 {
+        let mut sum = 0.0_f32;
+        let mut count = 0_usize;
+        for &p in &fb.pixels {
+            if p == BG {
+                continue;
+            }
+            let r = ((p >> 16) & 0xFF) as f32;
+            let g = ((p >> 8) & 0xFF) as f32;
+            let b = (p & 0xFF) as f32;
+            sum += 0.299 * r + 0.587 * g + 0.114 * b;
+            count += 1;
+        }
+        assert!(count > 0, "expected at least one non-background pixel");
+        sum / count as f32
+    }
+
+    #[test]
+    fn lit_facing_light_brighter_than_facing_away() {
+        // front_triangle lies in the XY plane with outward normal +Z.
+        // light_dir is the travel direction of light rays.
+        // From +Z: light_dir = (0,0,-1) → toward light = (0,0,1) → full N·L.
+        // From -Z: light_dir = (0,0, 1) → toward light = (0,0,-1) → back-lit (ambient).
+        let camera = sample_camera(1.0);
+        let (vertices, triangles) = front_triangle();
+        let model = Mat4::identity();
+        let base = 0xFFFFFFFF;
+
+        let mut fb_front = Framebuffer::new(32, 32);
+        let mut fb_back = Framebuffer::new(32, 32);
+        render_mesh_lit(
+            &mut fb_front,
+            &camera,
+            &vertices,
+            &triangles,
+            &model,
+            base,
+            Vec3::new(0.0, 0.0, -1.0),
+        );
+        render_mesh_lit(
+            &mut fb_back,
+            &camera,
+            &vertices,
+            &triangles,
+            &model,
+            base,
+            Vec3::new(0.0, 0.0, 1.0),
+        );
+
+        let lum_front = mean_luminance(&fb_front);
+        let lum_back = mean_luminance(&fb_back);
+        assert!(
+            lum_front > lum_back,
+            "triangle facing the light ({lum_front}) must be brighter than back-lit ({lum_back})"
+        );
+    }
+
+    #[test]
+    fn lit_fully_backlit_visible_pixels_are_not_pure_black() {
+        let camera = sample_camera(1.0);
+        let (vertices, triangles) = front_triangle();
+        let model = Mat4::identity();
+        let base = 0xFFFFFFFF;
+        // Light travels +Z → source behind the +Z-facing triangle.
+        let light_dir = Vec3::new(0.0, 0.0, 1.0);
+
+        let mut fb = Framebuffer::new(32, 32);
+        render_mesh_lit(
+            &mut fb, &camera, &vertices, &triangles, &model, base, light_dir,
+        );
+
+        let lit: Vec<u32> = fb.pixels.iter().copied().filter(|&p| p != BG).collect();
+        assert!(
+            !lit.is_empty(),
+            "back-lit but camera-facing triangle must draw pixels"
+        );
+        for p in lit {
+            assert_ne!(
+                p, 0xFF00_0000,
+                "ambient floor must keep pixels off pure black"
+            );
+            // Alpha always opaque.
+            assert_eq!(p >> 24, 0xFF, "alpha channel must remain 0xFF");
+        }
+    }
+
+    #[test]
+    fn lit_identical_scene_renders_byte_identical_checksums() {
+        let camera = sample_camera(1.0);
+        let (vertices, triangles) = front_triangle();
+        let model = Mat4::identity();
+        let base = 0xFFE0E0E0;
+        let light_dir = Vec3::new(0.3, -0.5, -1.0);
+
+        let mut fb_a = Framebuffer::new(32, 32);
+        let mut fb_b = Framebuffer::new(32, 32);
+        render_mesh_lit(
+            &mut fb_a, &camera, &vertices, &triangles, &model, base, light_dir,
+        );
+        render_mesh_lit(
+            &mut fb_b, &camera, &vertices, &triangles, &model, base, light_dir,
+        );
 
         assert_eq!(fb_a.checksum(), fb_b.checksum());
         assert_eq!(fb_a.pixels, fb_b.pixels);
