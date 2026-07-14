@@ -5,7 +5,7 @@ states:
   active: [OPEN, IN_PROGRESS, REVIEW]
   terminal: [DONE, CANCELLED]
 executor:
-  default: grok
+  default: codex
   max_turns: 8
 workspace:
   root: .autodev-workspaces
