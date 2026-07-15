@@ -18,6 +18,65 @@ struct ScreenVertex {
     depth: f32,
 }
 
+/// Samples opaque AARRGGBB colors from normalized texture coordinates.
+pub trait TextureSampler {
+    fn sample(&self, u: f32, v: f32) -> u32;
+}
+
+#[derive(Clone, Copy, Debug)]
+struct TexturedScreenVertex {
+    screen: ScreenVertex,
+    u_over_w: f32,
+    v_over_w: f32,
+    inv_w: f32,
+}
+
+/// Renders a textured triangle mesh with depth and screen-space back-face culling.
+pub fn render_mesh_textured<S: TextureSampler>(
+    fb: &mut Framebuffer,
+    camera: &Camera,
+    vertices: &[Vec3],
+    uvs: &[[f32; 2]],
+    triangles: &[[usize; 3]],
+    model: &Mat4,
+    sampler: &S,
+) {
+    assert_eq!(
+        vertices.len(),
+        uvs.len(),
+        "vertices and uvs must correspond"
+    );
+
+    let view_proj = camera.view_projection();
+    let mvp = view_proj.multiply(*model);
+    let width = fb.width as f32;
+    let height = fb.height as f32;
+    let near = camera.near;
+    let mut depth = vec![f32::INFINITY; fb.width * fb.height];
+    let clip: Vec<ClipVertex> = vertices
+        .iter()
+        .copied()
+        .map(|v| transform_point_homogeneous(mvp, v))
+        .collect();
+
+    for tri in triangles {
+        let c0 = clip[tri[0]];
+        let c1 = clip[tri[1]];
+        let c2 = clip[tri[2]];
+        if c0.w <= near || c1.w <= near || c2.w <= near {
+            continue;
+        }
+
+        let s0 = textured_clip_to_screen(c0, uvs[tri[0]], width, height);
+        let s1 = textured_clip_to_screen(c1, uvs[tri[1]], width, height);
+        let s2 = textured_clip_to_screen(c2, uvs[tri[2]], width, height);
+        if screen_signed_area_ccw(s0.screen.pos, s1.screen.pos, s2.screen.pos) <= 0 {
+            continue;
+        }
+        fill_triangle_textured(fb, &mut depth, s0, s1, s2, sampler);
+    }
+}
+
 /// Renders a triangle mesh into `fb` using a perspective camera.
 ///
 /// Each vertex is transformed by `model`, then by `camera.view_projection()`.
@@ -305,6 +364,21 @@ fn clip_to_screen(v: ClipVertex, width: f32, height: f32) -> ScreenVertex {
     }
 }
 
+fn textured_clip_to_screen(
+    v: ClipVertex,
+    uv: [f32; 2],
+    width: f32,
+    height: f32,
+) -> TexturedScreenVertex {
+    let inv_w = 1.0 / v.w;
+    TexturedScreenVertex {
+        screen: clip_to_screen(v, width, height),
+        u_over_w: uv[0] * inv_w,
+        v_over_w: uv[1] * inv_w,
+        inv_w,
+    }
+}
+
 /// Integer edge-function rasterizer with barycentric depth interpolation.
 fn fill_triangle_depth(
     fb: &mut Framebuffer,
@@ -377,6 +451,81 @@ fn fill_triangle_depth(
                     depth[idx] = z;
                     fb.set_pixel(x as usize, y as usize, color);
                 }
+            }
+        }
+    }
+}
+
+fn fill_triangle_textured<S: TextureSampler>(
+    fb: &mut Framebuffer,
+    depth: &mut [f32],
+    v0: TexturedScreenVertex,
+    v1: TexturedScreenVertex,
+    v2: TexturedScreenVertex,
+    sampler: &S,
+) {
+    let p0 = v0.screen.pos;
+    let p1 = v1.screen.pos;
+    let p2 = v2.screen.pos;
+    let signed_area = edge_function(p0, p1, 2 * i128::from(p2.x), 2 * i128::from(p2.y));
+    if signed_area == 0 {
+        return;
+    }
+    let orientation = if signed_area < 0 { -1 } else { 1 };
+    let top_left_0 = if orientation > 0 {
+        is_top_left(p1, p2)
+    } else {
+        is_top_left(p2, p1)
+    };
+    let top_left_1 = if orientation > 0 {
+        is_top_left(p2, p0)
+    } else {
+        is_top_left(p0, p2)
+    };
+    let top_left_2 = if orientation > 0 {
+        is_top_left(p0, p1)
+    } else {
+        is_top_left(p1, p0)
+    };
+    let min_x = i128::from(p0.x.min(p1.x).min(p2.x)).max(0);
+    let max_x = i128::from(p0.x.max(p1.x).max(p2.x)).min(fb.width as i128);
+    let min_y = i128::from(p0.y.min(p1.y).min(p2.y)).max(0);
+    let max_y = i128::from(p0.y.max(p1.y).max(p2.y)).min(fb.height as i128);
+    if min_x >= max_x || min_y >= max_y {
+        return;
+    }
+
+    for y in min_y..max_y {
+        for x in min_x..max_x {
+            let sample_x = 2 * x + 1;
+            let sample_y = 2 * y + 1;
+            let edge_0 = orientation * edge_function(p1, p2, sample_x, sample_y);
+            let edge_1 = orientation * edge_function(p2, p0, sample_x, sample_y);
+            let edge_2 = orientation * edge_function(p0, p1, sample_x, sample_y);
+            if !(edge_contains(edge_0, top_left_0)
+                && edge_contains(edge_1, top_left_1)
+                && edge_contains(edge_2, top_left_2))
+            {
+                continue;
+            }
+            let area = edge_0 + edge_1 + edge_2;
+            if area == 0 {
+                continue;
+            }
+            let inv_area = 1.0 / (area as f32);
+            let b0 = edge_0 as f32 * inv_area;
+            let b1 = edge_1 as f32 * inv_area;
+            let b2 = edge_2 as f32 * inv_area;
+            let z = b0 * v0.screen.depth + b1 * v1.screen.depth + b2 * v2.screen.depth;
+            let idx = (y as usize) * fb.width + (x as usize);
+            if z < depth[idx] {
+                let inv_w = b0 * v0.inv_w + b1 * v1.inv_w + b2 * v2.inv_w;
+                let u_over_w = b0 * v0.u_over_w + b1 * v1.u_over_w + b2 * v2.u_over_w;
+                let v_over_w = b0 * v0.v_over_w + b1 * v1.v_over_w + b2 * v2.v_over_w;
+                let u = u_over_w / inv_w;
+                let v = v_over_w / inv_w;
+                depth[idx] = z;
+                fb.set_pixel(x as usize, y as usize, sampler.sample(u, v) | 0xFF00_0000);
             }
         }
     }
@@ -883,5 +1032,133 @@ mod tests {
 
         assert_eq!(fb_a.checksum(), fb_b.checksum());
         assert_eq!(fb_a.pixels, fb_b.pixels);
+    }
+
+    struct UvSampler;
+
+    impl TextureSampler for UvSampler {
+        fn sample(&self, u: f32, v: f32) -> u32 {
+            let u = (u.clamp(0.0, 1.0) * 255.0).round() as u32;
+            let v = (v.clamp(0.0, 1.0) * 255.0).round() as u32;
+            0xFF00_0000 | (u << 8) | v
+        }
+    }
+
+    #[test]
+    fn textured_vertex_attributes_preserve_boundary_uvs() {
+        let vertices = [
+            ClipVertex {
+                x: -1.0,
+                y: -1.0,
+                z: 0.0,
+                w: 2.0,
+            },
+            ClipVertex {
+                x: 1.0,
+                y: -1.0,
+                z: 0.0,
+                w: 2.0,
+            },
+            ClipVertex {
+                x: 0.0,
+                y: 1.0,
+                z: 0.0,
+                w: 2.0,
+            },
+        ];
+        let uvs = [[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]];
+        for (vertex, uv) in vertices.into_iter().zip(uvs) {
+            let textured = textured_clip_to_screen(vertex, uv, 32.0, 32.0);
+            assert_eq!(textured.u_over_w, uv[0] / vertex.w);
+            assert_eq!(textured.v_over_w, uv[1] / vertex.w);
+            assert_eq!(textured.inv_w, 1.0 / vertex.w);
+        }
+    }
+
+    #[test]
+    fn textured_render_uses_perspective_correct_uvs() {
+        let camera = sample_camera(1.0);
+        let vertices = [
+            Vec3::new(-1.0, -1.0, 0.0),
+            Vec3::new(1.0, -1.0, 0.0),
+            Vec3::new(0.0, 1.0, -5.0),
+        ];
+        let uvs = [[0.0, 0.0], [1.0, 0.0], [0.2, 1.0]];
+        let triangles = [[0, 1, 2]];
+        let mut fb = Framebuffer::new(64, 64);
+        render_mesh_textured(
+            &mut fb,
+            &camera,
+            &vertices,
+            &uvs,
+            &triangles,
+            &Mat4::identity(),
+            &UvSampler,
+        );
+
+        let pixel = fb.get_pixel(32, 32).expect("center in bounds");
+        assert_ne!(pixel, BG, "center must be covered by the test triangle");
+        let clip: Vec<ClipVertex> = vertices
+            .iter()
+            .copied()
+            .map(|v| transform_point_homogeneous(camera.view_projection(), v))
+            .collect();
+        let screen: Vec<ScreenVertex> = clip
+            .iter()
+            .copied()
+            .map(|v| clip_to_screen(v, 64.0, 64.0))
+            .collect();
+        let signed_area = edge_function(
+            screen[0].pos,
+            screen[1].pos,
+            2 * i128::from(screen[2].pos.x),
+            2 * i128::from(screen[2].pos.y),
+        );
+        let orientation = if signed_area < 0 { -1 } else { 1 };
+        let sample_x = 2 * 32 + 1;
+        let sample_y = 2 * 32 + 1;
+        let area = (orientation
+            * (edge_function(screen[1].pos, screen[2].pos, sample_x, sample_y)
+                + edge_function(screen[2].pos, screen[0].pos, sample_x, sample_y)
+                + edge_function(screen[0].pos, screen[1].pos, sample_x, sample_y)))
+            as f32;
+        let b0 = (orientation * edge_function(screen[1].pos, screen[2].pos, sample_x, sample_y))
+            as f32
+            / area;
+        let b1 = (orientation * edge_function(screen[2].pos, screen[0].pos, sample_x, sample_y))
+            as f32
+            / area;
+        let b2 = (orientation * edge_function(screen[0].pos, screen[1].pos, sample_x, sample_y))
+            as f32
+            / area;
+        let naive_uv = [
+            b0 * uvs[0][0] + b1 * uvs[1][0] + b2 * uvs[2][0],
+            b0 * uvs[0][1] + b1 * uvs[1][1] + b2 * uvs[2][1],
+        ];
+        let inv_w = [1.0 / clip[0].w, 1.0 / clip[1].w, 1.0 / clip[2].w];
+        let denominator = b0 * inv_w[0] + b1 * inv_w[1] + b2 * inv_w[2];
+        let correct_uv = [
+            (b0 * uvs[0][0] * inv_w[0] + b1 * uvs[1][0] * inv_w[1] + b2 * uvs[2][0] * inv_w[2])
+                / denominator,
+            (b0 * uvs[0][1] * inv_w[0] + b1 * uvs[1][1] * inv_w[1] + b2 * uvs[2][1] * inv_w[2])
+                / denominator,
+        ];
+        let actual_uv = [
+            ((pixel >> 8) & 0xFF) as f32 / 255.0,
+            (pixel & 0xFF) as f32 / 255.0,
+        ];
+        assert!(
+            (actual_uv[0] - correct_uv[0]).abs() < 0.01,
+            "actual={actual_uv:?} correct={correct_uv:?} naive={naive_uv:?} bary={b0},{b1},{b2}"
+        );
+        assert!(
+            (actual_uv[1] - correct_uv[1]).abs() < 0.01,
+            "actual={actual_uv:?} correct={correct_uv:?} naive={naive_uv:?} bary={b0},{b1},{b2}"
+        );
+        assert!(clip[2].w >= clip[0].w * 2.0);
+        assert!(
+            (correct_uv[0] - naive_uv[0]).abs() > 0.05
+                || (correct_uv[1] - naive_uv[1]).abs() > 0.05
+        );
     }
 }
