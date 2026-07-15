@@ -14,8 +14,22 @@ use nova3d::io::to_ppm;
 use nova3d::math::{Quat, Vec3};
 use nova3d::mesh;
 use nova3d::raster::Framebuffer;
-use nova3d::render::render_mesh_lit;
+use nova3d::render::{render_mesh_textured, render_mesh_lit, TextureSampler};
 use nova3d::scene::Transform;
+
+struct Checkerboard;
+
+impl TextureSampler for Checkerboard {
+    fn sample(&self, u: f32, v: f32) -> u32 {
+        let x = (u.clamp(0.0, 1.0) * 2.0).floor().min(1.0) as usize;
+        let y = (v.clamp(0.0, 1.0) * 2.0).floor().min(1.0) as usize;
+        if (x + y) % 2 == 0 {
+            0xFFFFFFFF
+        } else {
+            0xFF202020
+        }
+    }
+}
 
 fn main() {
     const WIDTH: usize = 64;
@@ -60,4 +74,43 @@ fn main() {
         println!("# frame {frame}");
         print!("{}", to_ppm(&fb));
     }
+
+    const FACE_CORNERS: [[usize; 4]; 6] = [
+        [4, 5, 6, 7],
+        [1, 0, 3, 2],
+        [5, 1, 2, 6],
+        [0, 4, 7, 3],
+        [3, 7, 6, 2],
+        [0, 1, 5, 4],
+    ];
+    const FACE_UVS: [[f32; 2]; 4] = [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]];
+
+    let textured_vertices: Vec<Vec3> = FACE_CORNERS
+        .iter()
+        .flat_map(|face| face.iter().map(|&index| vertices[index]))
+        .collect();
+    let textured_uvs: Vec<[f32; 2]> = (0..FACE_CORNERS.len())
+        .flat_map(|_| FACE_UVS)
+        .collect();
+    let textured_triangles: Vec<[usize; 3]> = (0..FACE_CORNERS.len())
+        .flat_map(|face| {
+            let base = face * 4;
+            [[base, base + 1, base + 2], [base, base + 2, base + 3]]
+        })
+        .collect();
+
+    let mut fb = Framebuffer::new(WIDTH, HEIGHT);
+    let model = Transform::IDENTITY.to_mat4();
+    render_mesh_textured(
+        &mut fb,
+        &camera,
+        &textured_vertices,
+        &textured_uvs,
+        &textured_triangles,
+        &model,
+        &Checkerboard,
+    );
+
+    println!("# frame 3");
+    print!("{}", to_ppm(&fb));
 }

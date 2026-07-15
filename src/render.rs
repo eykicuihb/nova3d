@@ -18,6 +18,63 @@ struct ScreenVertex {
     depth: f32,
 }
 
+/// Supplies colors for normalized texture coordinates in AARRGGBB format.
+pub trait TextureSampler {
+    /// Samples an opaque color at normalized coordinates in the `[0.0, 1.0]` range.
+    fn sample(&self, u: f32, v: f32) -> u32;
+}
+
+#[derive(Clone, Copy, Debug)]
+struct TexturedScreenVertex {
+    screen: ScreenVertex,
+    inv_w: f32,
+    u_over_w: f32,
+    v_over_w: f32,
+}
+
+/// Renders a textured triangle mesh with depth and screen-space back-face culling.
+///
+/// UVs are paired with vertices by index. The sampler receives perspective-corrected
+/// normalized coordinates and returns an opaque AARRGGBB color.
+pub fn render_mesh_textured<S: TextureSampler>(
+    fb: &mut Framebuffer,
+    camera: &Camera,
+    vertices: &[Vec3],
+    uvs: &[[f32; 2]],
+    triangles: &[[usize; 3]],
+    model: &Mat4,
+    sampler: &S,
+) {
+    let view_proj = camera.view_projection();
+    let mvp = view_proj.multiply(*model);
+    let width = fb.width as f32;
+    let height = fb.height as f32;
+    let near = camera.near;
+    let mut depth = vec![f32::INFINITY; fb.width * fb.height];
+    let clip: Vec<ClipVertex> = vertices
+        .iter()
+        .copied()
+        .map(|v| transform_point_homogeneous(mvp, v))
+        .collect();
+
+    for tri in triangles {
+        let v0 = clip[tri[0]];
+        let v1 = clip[tri[1]];
+        let v2 = clip[tri[2]];
+        if v0.w <= near || v1.w <= near || v2.w <= near {
+            continue;
+        }
+
+        let s0 = textured_clip_to_screen(v0, uvs[tri[0]], width, height);
+        let s1 = textured_clip_to_screen(v1, uvs[tri[1]], width, height);
+        let s2 = textured_clip_to_screen(v2, uvs[tri[2]], width, height);
+        if screen_signed_area_ccw(s0.screen.pos, s1.screen.pos, s2.screen.pos) <= 0 {
+            continue;
+        }
+        fill_triangle_textured(fb, &mut depth, s0, s1, s2, sampler);
+    }
+}
+
 /// Renders a triangle mesh into `fb` using a perspective camera.
 ///
 /// Each vertex is transformed by `model`, then by `camera.view_projection()`.
@@ -302,6 +359,98 @@ fn clip_to_screen(v: ClipVertex, width: f32, height: f32) -> ScreenVertex {
             y: y_screen.round() as i32,
         },
         depth: ndc_z,
+    }
+}
+
+fn textured_clip_to_screen(
+    v: ClipVertex,
+    uv: [f32; 2],
+    width: f32,
+    height: f32,
+) -> TexturedScreenVertex {
+    let inv_w = 1.0 / v.w;
+    TexturedScreenVertex {
+        screen: clip_to_screen(v, width, height),
+        inv_w,
+        u_over_w: uv[0] * inv_w,
+        v_over_w: uv[1] * inv_w,
+    }
+}
+
+fn fill_triangle_textured<S: TextureSampler>(
+    fb: &mut Framebuffer,
+    depth: &mut [f32],
+    v0: TexturedScreenVertex,
+    v1: TexturedScreenVertex,
+    v2: TexturedScreenVertex,
+    sampler: &S,
+) {
+    let p0 = v0.screen.pos;
+    let p1 = v1.screen.pos;
+    let p2 = v2.screen.pos;
+    let signed_area = edge_function(p0, p1, 2 * i128::from(p2.x), 2 * i128::from(p2.y));
+    if signed_area == 0 {
+        return;
+    }
+
+    let orientation = if signed_area < 0 { -1 } else { 1 };
+    let top_left_0 = if orientation > 0 {
+        is_top_left(p1, p2)
+    } else {
+        is_top_left(p2, p1)
+    };
+    let top_left_1 = if orientation > 0 {
+        is_top_left(p2, p0)
+    } else {
+        is_top_left(p0, p2)
+    };
+    let top_left_2 = if orientation > 0 {
+        is_top_left(p0, p1)
+    } else {
+        is_top_left(p1, p0)
+    };
+    let min_x = i128::from(p0.x.min(p1.x).min(p2.x)).max(0);
+    let max_x = i128::from(p0.x.max(p1.x).max(p2.x)).min(fb.width as i128);
+    let min_y = i128::from(p0.y.min(p1.y).min(p2.y)).max(0);
+    let max_y = i128::from(p0.y.max(p1.y).max(p2.y)).min(fb.height as i128);
+    if min_x >= max_x || min_y >= max_y {
+        return;
+    }
+
+    for y in min_y..max_y {
+        for x in min_x..max_x {
+            let sample_x = 2 * x + 1;
+            let sample_y = 2 * y + 1;
+            let edge_0 = orientation * edge_function(p1, p2, sample_x, sample_y);
+            let edge_1 = orientation * edge_function(p2, p0, sample_x, sample_y);
+            let edge_2 = orientation * edge_function(p0, p1, sample_x, sample_y);
+            if !(edge_contains(edge_0, top_left_0)
+                && edge_contains(edge_1, top_left_1)
+                && edge_contains(edge_2, top_left_2))
+            {
+                continue;
+            }
+
+            let area = edge_0 + edge_1 + edge_2;
+            if area == 0 {
+                continue;
+            }
+            let inv_area = 1.0 / area as f32;
+            let b0 = edge_0 as f32 * inv_area;
+            let b1 = edge_1 as f32 * inv_area;
+            let b2 = edge_2 as f32 * inv_area;
+            let z = b0 * v0.screen.depth + b1 * v1.screen.depth + b2 * v2.screen.depth;
+            let idx = y as usize * fb.width + x as usize;
+            if z < depth[idx] {
+                let inv_w = b0 * v0.inv_w + b1 * v1.inv_w + b2 * v2.inv_w;
+                let u_over_w = b0 * v0.u_over_w + b1 * v1.u_over_w + b2 * v2.u_over_w;
+                let v_over_w = b0 * v0.v_over_w + b1 * v1.v_over_w + b2 * v2.v_over_w;
+                let u = u_over_w / inv_w;
+                let v = v_over_w / inv_w;
+                depth[idx] = z;
+                fb.set_pixel(x as usize, y as usize, sampler.sample(u, v));
+            }
+        }
     }
 }
 
@@ -883,5 +1032,49 @@ mod tests {
 
         assert_eq!(fb_a.checksum(), fb_b.checksum());
         assert_eq!(fb_a.pixels, fb_b.pixels);
+    }
+
+    struct Quadrants;
+
+    impl TextureSampler for Quadrants {
+        fn sample(&self, u: f32, v: f32) -> u32 {
+            match (u >= 0.5, v >= 0.5) {
+                (false, false) => 0xFFFF0000,
+                (true, false) => 0xFF00FF00,
+                (false, true) => 0xFF0000FF,
+                (true, true) => 0xFFFFFF00,
+            }
+        }
+    }
+
+    #[test]
+    fn textured_triangle_is_deterministic_and_samples_uvs() {
+        let camera = sample_camera(1.0);
+        let vertices = vec![
+            Vec3::new(-1.0, -1.0, 0.0),
+            Vec3::new(1.0, -1.0, 0.0),
+            Vec3::new(0.0, 1.0, 0.0),
+        ];
+        let triangles = vec![[0, 1, 2]];
+        let uvs = [[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]];
+        let model = Mat4::identity();
+        let mut first = Framebuffer::new(32, 32);
+        let mut second = Framebuffer::new(32, 32);
+
+        render_mesh_textured(
+            &mut first, &camera, &vertices, &uvs, &triangles, &model, &Quadrants,
+        );
+        render_mesh_textured(
+            &mut second,
+            &camera,
+            &vertices,
+            &uvs,
+            &triangles,
+            &model,
+            &Quadrants,
+        );
+
+        assert_eq!(first.checksum(), second.checksum());
+        assert!(first.pixels.iter().any(|&pixel| pixel != BG));
     }
 }
